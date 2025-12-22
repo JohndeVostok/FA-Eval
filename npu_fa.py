@@ -1,11 +1,14 @@
 import math
 import torch
+import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 import numpy as np
 import time
+
+from torch_npu.contrib import transfer_to_npu
 
 def torch_fa_fwd(
     q, k, v,
@@ -37,23 +40,15 @@ def torch_fa_bwd(
     dk = (torch.matmul(ds.to(LOW_TYPE).transpose(-1, -2), q) * scale)
     return dq, dk, dv
 
-
-configs = [
-    triton.Config({}, num_warps=4, num_stages=2),
-    triton.Config({}, num_warps=4, num_stages=3),
-    triton.Config({}, num_warps=4, num_stages=4),
-    triton.Config({}, num_warps=4, num_stages=5),
-    triton.Config({}, num_warps=8, num_stages=2),
-    triton.Config({}, num_warps=8, num_stages=3),
-    triton.Config({}, num_warps=8, num_stages=4),
-    triton.Config({}, num_warps=8, num_stages=5),
-    triton.Config({}, num_warps=8, num_stages=2),
-    triton.Config({}, num_warps=8, num_stages=3),
-    triton.Config({}, num_warps=8, num_stages=4),
-    triton.Config({}, num_warps=8, num_stages=5),
-]
-
-@triton.autotune(configs=configs, key=['S', 'N', 'H'])
+@triton.autotune(
+    configs=[
+        triton.Config({'multibuffer': True, "BLOCK_R": 128, "BLOCK_C": 128}),
+        triton.Config({'multibuffer': True, "BLOCK_R": 64, "BLOCK_C": 128}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 256, "BLOCK_C": 128}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 128, "BLOCK_C": 128}),
+    ],
+    key=["B", "N", "S", "H"],
+)
 @triton.jit
 def kernel_fa_fwd(
     q, k, v, o,
@@ -102,7 +97,7 @@ def kernel_fa_fwd(
             block_v = tl.load(v + offset_kv)
 
             block_s = tl.dot(block_q, block_k.T).to(HIGH_TYPE) * scale
-            block_s += tl.where(block_mask, 0, -float("inf"))
+            #block_s += tl.where(block_mask, 0, -float("inf"))
             block_m_1 = tl.maximum(block_m, tl.max(block_s, axis=1))
             block_s = tl.exp(block_s - block_m_1[:, None])
             block_l_1 = tl.exp(block_m - block_m_1) * block_l + tl.sum(block_s, axis=1)
@@ -119,16 +114,15 @@ def kernel_fa_fwd(
         # tl.store(lse + offset_lse, block_lse, mask=mask_lse)
         tl.store(lse + offset_lse, block_lse)
 
-config_d = [
-    triton.Config({}, num_warps=4),
-    triton.Config({}, num_warps=8),
-    triton.Config({}, num_warps=16),
-    triton.Config({}, num_warps=32),
-    triton.Config({}, num_warps=64),
-    triton.Config({}, num_warps=128),
-]
-
-@triton.autotune(configs=configs, key=['S', 'N', 'H'])
+@triton.autotune(
+    configs=[
+        triton.Config({'multibuffer': True, "BLOCK_R": 128}),
+        triton.Config({'multibuffer': True, "BLOCK_R": 64}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 256}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 128}),
+    ],
+    key=["B", "N", "S", "H"],
+)
 @triton.jit
 def kernel_fa_bwd_d(
     o, do, d,
@@ -161,7 +155,15 @@ def kernel_fa_bwd_d(
         tl.store(d + offset_d, block_d)
 
 
-@triton.autotune(configs=configs, key=['S', 'N', 'H'])
+@triton.autotune(
+    configs=[
+        triton.Config({'multibuffer': True, "BLOCK_R": 128, "BLOCK_C": 64}),
+        triton.Config({'multibuffer': True, "BLOCK_R": 64, "BLOCK_C": 64}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 128, "BLOCK_C": 128}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 128, "BLOCK_C": 64}),
+    ],
+    key=["B", "N", "S", "H"],
+)
 @triton.jit
 def kernel_fa_bwd_kv(
     q, k, v, do, d, dk, dv,
@@ -217,7 +219,7 @@ def kernel_fa_bwd_kv(
             block_mask = tl.load(mask + offset_mask)
 
             block_s = tl.dot(block_q, block_k.T).to(HIGH_TYPE) * scale
-            block_s += tl.where(block_mask, 0, -float("inf"))
+            # block_s += tl.where(block_mask, 0, -float("inf"))
             block_p = tl.exp(block_s - block_lse[:, None])
             block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
             block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
@@ -230,7 +232,15 @@ def kernel_fa_bwd_kv(
         tl.store(dv + offset_kv, block_dv.to(LOW_TYPE))
 
 
-@triton.autotune(configs=configs, key=['S', 'N', 'H'])
+@triton.autotune(
+    configs=[
+        triton.Config({'multibuffer': True, "BLOCK_R": 128, "BLOCK_C": 64}),
+        triton.Config({'multibuffer': True, "BLOCK_R": 64, "BLOCK_C": 64}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 256, "BLOCK_C": 64}),
+        triton.Config({'multibuffer': False, "BLOCK_R": 128, "BLOCK_C": 64}),
+    ],
+    key=["B", "N", "S", "H"],
+)
 @triton.jit
 def kernel_fa_bwd_q(
     q, k, v, do, d, dq,
@@ -285,7 +295,7 @@ def kernel_fa_bwd_q(
             block_v = tl.load(v + offset_kv)
 
             block_s = tl.dot(block_q, block_k.T).to(HIGH_TYPE) * scale
-            block_s += tl.where(block_mask, 0, -float("inf"))
+            # block_s += tl.where(block_mask, 0, -float("inf"))
             block_p = tl.exp(block_s - block_lse[:, None])
             block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
             block_ds = block_p * (block_dp - block_d[:, None])
@@ -301,7 +311,7 @@ if __name__ == "__main__":
     N = 32
     H = 128
     scale = 1.0 / math.sqrt(H)
-    BLOCK_R = 128
+    BLOCK_R = 64
     BLOCK_C = 64
 
     LOW_TYPE = torch.bfloat16
@@ -309,73 +319,37 @@ if __name__ == "__main__":
     HIGH_TYPE = torch.float32
     TRITON_HIGH_TYPE = tl.float32
 
-    q = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="cuda")
-    k = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="cuda")
-    v = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="cuda")
-    mask = torch.ones((S, S), dtype=torch.bool, device="cuda")
+    q = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="npu")
+    k = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="npu")
+    v = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="npu")
+    mask = torch.ones((S, S), dtype=torch.bool, device="npu")
     o = torch.zeros_like(q)
     o = torch_fa_fwd(q, k, v, mask, scale, LOW_TYPE, HIGH_TYPE)
-    do = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="cuda")
+    do = torch.randn(B, N, S, H, dtype=LOW_TYPE, device="npu")
     dq, dk, dv = torch_fa_bwd(q, k, v, o, do, mask, scale, LOW_TYPE, HIGH_TYPE)
     d = torch.sum(do.to(HIGH_TYPE) * o.to(HIGH_TYPE), dim=-1)
 
-    triton_lse = torch.zeros((B, N, S), dtype=HIGH_TYPE, device="cuda")
-    triton_d = torch.empty((B, N, S), dtype=HIGH_TYPE, device="cuda")
+    triton_lse = torch.zeros((B, N, S), dtype=HIGH_TYPE, device="npu")
+    triton_d = torch.empty((B, N, S), dtype=HIGH_TYPE, device="npu")
     triton_o = torch.empty_like(o)
     triton_dq = torch.empty_like(dq)
     triton_dk = torch.empty_like(dk)
     triton_dv = torch.empty_like(dv)
-    kernel_fa_fwd[[78]](q, k, v, triton_o, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    kernel_fa_bwd_d[[78]](o, do, triton_d, B, N, S, H, BLOCK_R, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    kernel_fa_bwd_kv[[78]](q, k, v, do, d, triton_dk, triton_dv, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    kernel_fa_bwd_q[[78]](q, k, v, do, d, triton_dq, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
+    kernel_fa_fwd[[48]](q, k, v, triton_o, triton_lse, mask, scale, B, S, N, H)
+    kernel_fa_bwd_d[[48]](o, do, triton_d, B, N, S, H)
+    kernel_fa_bwd_kv[[48]](q, k, v, do, d, triton_dk, triton_dv, triton_lse, mask, scale, B, S, N, H)
+    kernel_fa_bwd_q[[48]](q, k, v, do, d, triton_dq, triton_lse, mask, scale, B, S, N, H)
     print(torch.sum(abs(o - triton_o) / (abs(o) + 0.01)) / o.numel())
     print(torch.sum(abs(dq - triton_dq) / (abs(dq) + 0.01)) / dq.numel())
     print(torch.sum(abs(dk - triton_dk) / (abs(dk) + 0.01)) / dk.numel())
     print(torch.sum(abs(dv - triton_dv) / (abs(dv) + 0.01)) / dv.numel())
 
-    num_eval = 32
-    torch.cuda.synchronize()
-    for _ in range(num_eval):
-        kernel_fa_fwd[[78]](q, k, v, triton_o, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    st = time.time()
-    for _ in range(num_eval):
-        kernel_fa_fwd[[78]](q, k, v, triton_o, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    print(f"fa_fwd time: {(time.time() - st) / 1024 * 1000} ms, FLOPS: {2 * B * N * S * H * (S + H) / (time.time() - st) * num_eval / 1e12} TFLOPS")
+    time = triton.testing.do_bench_npu(lambda: kernel_fa_fwd[[24]](q, k, v, triton_o, triton_lse, mask, scale, B, S, N, H))
+    print(f"fa_fwd time: {time / 1e3} ms, FLOPS: {2 * B * N * S * H * (S + H) / time * 1e6 / 1e12} TFLOPS")
+    time = triton.testing.do_bench_npu(lambda: kernel_fa_bwd_d[[48]](o, do, triton_d, B, N, S, H))
+    print(f"fa_bwd_d time: {time / 1e3} ms, bandwidth: {2 * B * N * S * H * 2 / time * 1e6 / 1e9} GB/s")
+    time = triton.testing.do_bench_npu(lambda: kernel_fa_bwd_kv[[48]](q, k, v, do, d, triton_dk, triton_dv, triton_lse, mask, scale, B, S, N, H))
+    print(f"fa_bwd_kv time: {time / 1e3} ms, FLOPS: {2 * B * N * S * H * (S + H) * 2 / time * 1e6 / 1e12} TFLOPS")
+    time = triton.testing.do_bench_npu(lambda: kernel_fa_bwd_q[[48]](q, k, v, do, d, triton_dq, triton_lse, mask, scale, B, S, N, H))
+    print(f"fa_bwd_q time: {time / 1000} ms, FLOPS: {2 * B * N * S * H * (S * 2 + H) / time * 1e6 / 1e12} TFLOPS")
 
-    torch.cuda.synchronize()
-    for _ in range(num_eval):
-        kernel_fa_bwd_d[[78]](o, do, triton_d, B, N, S, H, BLOCK_R, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    st = time.time()
-    for _ in range(num_eval):
-        kernel_fa_bwd_d[[78]](o, do, triton_d, B, N, S, H, BLOCK_R, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    print(f"fa_bwd_d time: {(time.time() - st) / 1024 * 1000} ms, bandwidth: {2 * B * N * S * H * 2 / (time.time() - st) * num_eval / 1e9} GB/s")
-
-    torch.cuda.synchronize()
-    for _ in range(num_eval):
-        kernel_fa_bwd_kv[[78]](q, k, v, do, d, triton_dk, triton_dv, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    st = time.time()
-    for _ in range(num_eval):
-        kernel_fa_bwd_kv[[78]](q, k, v, do, d, triton_dk, triton_dv, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    print(f"fa_bwd_kv time: {(time.time() - st) / 1024 * 1000} ms, FLOPS: {2 * B * N * S * H * (S + H) * 2 / (time.time() - st) * num_eval / 1e12} TFLOPS")
-
-    torch.cuda.synchronize()
-    for _ in range(num_eval):
-        kernel_fa_bwd_q[[78]](q, k, v, do, d, triton_dq, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    st = time.time()
-    for _ in range(num_eval):
-        kernel_fa_bwd_q[[78]](q, k, v, do, d, triton_dq, triton_lse, mask, scale, B, S, N, H, BLOCK_R, BLOCK_C, TRITON_LOW_TYPE, TRITON_HIGH_TYPE)
-    torch.cuda.synchronize()
-    print(f"fa_bwd_q time: {(time.time() - st) / 1024 * 1000} ms, FLOPS: {2 * B * N * S * H * (S * 2 + H) / (time.time() - st) * num_eval / 1e12} TFLOPS")
-
-
-
-
-    
